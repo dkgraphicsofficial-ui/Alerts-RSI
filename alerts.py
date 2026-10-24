@@ -70,8 +70,8 @@ def rsi(values, period=14):
 
 
 def telegram(text):
-    token = os.environ.get("TELEGRAM_TOKEN")
-    chat = os.environ.get("TELEGRAM_CHAT_ID")
+    token = (os.environ.get("TELEGRAM_TOKEN") or "").strip()
+    chat = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
     if not token or not chat:
         print("Telegram non configurato. Messaggio:", text)
         return
