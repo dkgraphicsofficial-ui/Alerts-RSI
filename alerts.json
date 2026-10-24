@@ -5,10 +5,6 @@
     { "symbol": "BTC", "type": "rsi", "condition": "above", "value": 70 },
     { "symbol": "BTC", "type": "rsi", "condition": "below", "value": 30 },
     { "symbol": "XAU", "type": "rsi", "condition": "above", "value": 70, "timeframe": "1h" },
-    { "symbol": "XAU", "type": "rsi", "condition": "below", "value": 30, "timeframe": "1h" },
-    { "symbol": "BTC", "type": "price", "condition": "above", "value": 100000 },
-    { "symbol": "BTC", "type": "price", "condition": "below", "value": 80000 },
-    { "symbol": "XAU", "type": "price", "condition": "above", "value": 4500 },
-    { "symbol": "XAU", "type": "price", "condition": "below", "value": 3500 }
+    { "symbol": "XAU", "type": "rsi", "condition": "below", "value": 30, "timeframe": "1h" }
   ]
 }
