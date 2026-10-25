@@ -5,6 +5,7 @@ Dati: Binance (data-api.binance.vision), con ripiego su Kraken.
 Oro: si usa PAXG (token legato all'oro), vicino all'XAUUSD ma non identico.
 Comandi Telegram: /alert, /rsi, /lista, /cancella, /aiuto.
 """
+import datetime
 import json
 import os
 import re
@@ -31,6 +32,7 @@ HELP = (
     "/rsi btc sopra 75\n"
     "/rsi oro sotto 25 1h\n"
     "/lista  (mostra gli alert)\n"
+    "/stato  (prezzo e RSI adesso)\n"
     "/cancella 2  (cancella l'alert numero 2)\n\n"
     "Timeframe RSI: 5m, 15m, 30m, 1h, 4h, 1d.\n"
     "Le modifiche vengono applicate entro circa 5 minuti."
@@ -232,6 +234,38 @@ def add_alert(cmd, args, cfg, state):
     return text, True
 
 
+def status_text(cfg):
+    tf = cfg.get("timeframe", "15m")
+    period = int(cfg.get("rsi_period", 14))
+    righe = [f"📊 Situazione adesso (RSI {period}, {tf}):"]
+    for sym, name in (("BTC", "BTC"), ("XAU", "Oro (PAXG)")):
+        try:
+            c = data(sym, tf)
+            chiusa = rsi(c[:-1], period)
+            corso = rsi(c, period)
+            if chiusa is None:
+                righe.append(f"{name}: prezzo {c[-1]:,.2f}")
+            else:
+                righe.append(f"{name}: prezzo {c[-1]:,.2f} | RSI ultima candela chiusa {chiusa:.1f}, in corso {corso:.1f}")
+        except Exception as e:
+            print(f"stato {sym}: {e}")
+            righe.append(f"{name}: dati non disponibili")
+    return "\n".join(righe)
+
+
+def heartbeat(cfg, state):
+    """Un messaggio al giorno (dopo le 07 UTC) per sapere che il sistema e' vivo."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    if now.hour < 7 or state.get("_hb") == today:
+        return
+    try:
+        telegram("💚 Sistema attivo.\n" + status_text(cfg))
+        state["_hb"] = today
+    except Exception as e:
+        print(f"heartbeat non inviato: {e}")
+
+
 def run_command(text, cfg, state):
     parts = text.lower().replace(">", " sopra ").replace("<", " sotto ").split()
     if not parts:
@@ -243,6 +277,8 @@ def run_command(text, cfg, state):
         return HELP, False
     if cmd == "lista":
         return list_text(cfg), False
+    if cmd == "stato":
+        return status_text(cfg), False
     try:
         if cmd == "cancella":
             n = int(args[0])
@@ -299,6 +335,7 @@ def handle_commands(cfg, state):
 
 def check_alerts(cfg, state):
     new_state = {}
+    failed = set()
     for a in cfg["alerts"]:
         key = alert_key(a, cfg)
         was = state.get(key, False)
@@ -306,6 +343,7 @@ def check_alerts(cfg, state):
             cur, price = current_value(a, cfg)
         except Exception as e:
             print(f"salto {key}: {e}")
+            failed.add(norm(a["symbol"]))
             new_state[key] = was
             continue
         if cur is None:
@@ -313,6 +351,7 @@ def check_alerts(cfg, state):
             continue
 
         hit = is_hit(a, cur)
+        print(f"{key}: valore {cur:.2f} -> {'SCATTATO' if hit else 'ok'}")
         if hit and not was:
             name = "XAU (PAXG)" if norm(a["symbol"]) == "XAU" else "BTC"
             verso = "sopra" if a["condition"] == "above" else "sotto"
@@ -328,6 +367,25 @@ def check_alerts(cfg, state):
                 new_state[key] = was
                 continue
         new_state[key] = hit  # si riarma quando la condizione torna falsa
+
+    # avviso se i dati di un asset non sono leggibili per 3 controlli di fila
+    for sym in ("BTC", "XAU"):
+        k = f"_err|{sym}"
+        prima = state.get(k, 0)
+        try:
+            if sym in failed:
+                new_state[k] = prima + 1
+                if prima + 1 == 3:
+                    telegram(f"⚠️ Non riesco a leggere i prezzi di {sym} da 3 controlli di fila. "
+                             f"Gli alert su {sym} non funzionano finché i dati non tornano.")
+            elif prima >= 3:
+                telegram(f"✅ I dati di {sym} sono di nuovo disponibili.")
+        except Exception as e:
+            print(f"avviso errore non inviato: {e}")
+
+    for k, v in state.items():  # conserva valori di servizio (es. heartbeat)
+        if k.startswith("_") and not k.startswith("_err|"):
+            new_state.setdefault(k, v)
     return new_state
 
 
@@ -340,6 +398,8 @@ def main():
     state = load_json(STATE, {})
     handle_commands(cfg, state)
     state = check_alerts(cfg, state)
+    if cfg.get("heartbeat", True):
+        heartbeat(cfg, state)
     save_json(STATE, state)
 
 
