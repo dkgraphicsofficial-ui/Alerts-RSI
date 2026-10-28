@@ -1,46 +1,11 @@
 {
   "timeframe": "15m",
   "rsi_period": 14,
+  "adx_period": 14,
   "alerts": [
-    {
-      "symbol": "BTC",
-      "type": "rsi",
-      "condition": "above",
-      "value": 70,
-      "timeframe": "15m"
-    },
-    {
-      "symbol": "BTC",
-      "type": "rsi",
-      "condition": "below",
-      "value": 30,
-      "timeframe": "15m"
-    },
-    {
-      "symbol": "XAU",
-      "type": "rsi",
-      "condition": "above",
-      "value": 70,
-      "timeframe": "15m"
-    },
-    {
-      "symbol": "XAU",
-      "type": "rsi",
-      "condition": "below",
-      "value": 30,
-      "timeframe": "15m"
-    },
-    {
-      "symbol": "BTC",
-      "type": "price",
-      "condition": "above",
-      "value": 80845
-    },
-    {
-      "symbol": "BTC",
-      "type": "price",
-      "condition": "below",
-      "value": 80200
-    }
+    { "symbol": "BTC", "type": "adx", "condition": "above", "value": 25 },
+    { "symbol": "BTC", "type": "adx", "condition": "above", "value": 30 },
+    { "symbol": "XAU", "type": "adx", "condition": "above", "value": 25 },
+    { "symbol": "XAU", "type": "adx", "condition": "above", "value": 30 }
   ]
 }
