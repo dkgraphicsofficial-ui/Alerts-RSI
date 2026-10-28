@@ -35,6 +35,12 @@
       "type": "price",
       "condition": "above",
       "value": 80845
+    },
+    {
+      "symbol": "BTC",
+      "type": "price",
+      "condition": "below",
+      "value": 80200
     }
   ]
 }
