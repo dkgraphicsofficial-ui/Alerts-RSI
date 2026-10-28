@@ -2,10 +2,15 @@
   "timeframe": "15m",
   "rsi_period": 14,
   "adx_period": 14,
-  "alerts": [
-    { "symbol": "BTC", "type": "adx", "condition": "above", "value": 25 },
-    { "symbol": "BTC", "type": "adx", "condition": "above", "value": 30 },
-    { "symbol": "XAU", "type": "adx", "condition": "above", "value": 25 },
-    { "symbol": "XAU", "type": "adx", "condition": "above", "value": 30 }
-  ]
+  "strategy": {
+    "enabled": true,
+    "symbols": ["BTC", "XAU"],
+    "timeframe": "15m",
+    "rsi_long": 35,
+    "rsi_short": 65,
+    "ema": 200,
+    "macd": [12, 26, 9],
+    "solo_prima_candela": false
+  },
+  "alerts": []
 }
