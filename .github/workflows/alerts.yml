@@ -1,4 +1,4 @@
-name: Alert RSI e prezzo
+name: Alert BTC ADX e prezzo
 
 on:
   schedule:
