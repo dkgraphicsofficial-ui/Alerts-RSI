@@ -4,13 +4,16 @@
 BTC: Binance (data-api.binance.vision), con ripiego su Kraken.
 Oro: XAU/USD reale (spot) da Twelve Data, chiave nel secret TWELVEDATA_KEY.
 Il mercato dell'oro e' chiuso nel weekend: in quel periodo non viene controllato.
+Strategia: RSI a chiusura candela (long <=35, short >=65) + trend EMA e forza MACD.
 Comandi Telegram: /alert, /rsi, /adx, /lista, /stato, /cancella, /aiuto.
 """
+import calendar
 import datetime
 import json
 import os
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -21,6 +24,7 @@ STATE = os.path.join(BASE, "state.json")
 BINANCE = {"BTC": "BTCUSDT"}
 KRAKEN = {"BTC": "XBTUSD"}
 SUPPORTED = ("BTC", "XAU")
+TF_SEC = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
 TD_INT = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
           "1h": "1h", "4h": "4h", "1d": "1day"}
 KRAKEN_MIN = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
@@ -30,6 +34,8 @@ DIRS = {"sopra": "above", "su": "above", "above": "above",
         "sotto": "below", "giu": "below", "giù": "below", "below": "below"}
 
 HELP = (
+    "Strategia attiva: segnale quando la candela chiude con RSI <= 35 (long) o >= 65 (short), "
+    "con trend EMA200 e forza MACD. Le soglie sono in alerts.json.\n\n"
     "Comandi:\n"
     "/alert btc sopra 95000\n"
     "/alert oro sotto 4000\n"
@@ -86,9 +92,9 @@ def get_json(url):
 
 
 def candles_binance(sym, tf):
-    q = urllib.parse.urlencode({"symbol": BINANCE[sym], "interval": tf, "limit": 200})
+    q = urllib.parse.urlencode({"symbol": BINANCE[sym], "interval": tf, "limit": 1000})
     rows = get_json(f"https://data-api.binance.vision/api/v3/klines?{q}")
-    return [(float(r[2]), float(r[3]), float(r[4])) for r in rows]
+    return [(float(r[2]), float(r[3]), float(r[4]), r[0] / 1000) for r in rows]
 
 
 def candles_kraken(sym, tf):
@@ -97,7 +103,7 @@ def candles_kraken(sym, tf):
     if data.get("error"):
         raise RuntimeError(data["error"])
     rows = next(v for k, v in data["result"].items() if k != "last")
-    return [(float(r[2]), float(r[3]), float(r[4])) for r in rows][-200:]
+    return [(float(r[2]), float(r[3]), float(r[4]), float(r[0])) for r in rows][-1000:]
 
 
 class MarketClosed(Exception):
@@ -110,16 +116,25 @@ def gold_market_closed():
     return wd == 5 or (wd == 4 and h >= 22) or (wd == 6 and h < 21)
 
 
+def td_epoch(txt):
+    for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return float(calendar.timegm(time.strptime(txt, f)))
+        except ValueError:
+            pass
+    raise ValueError(f"data non valida: {txt}")
+
+
 def candles_twelvedata(tf):
     key = (os.environ.get("TWELVEDATA_KEY") or "").strip()
     if not key:
         raise RuntimeError("TWELVEDATA_KEY mancante")
     q = urllib.parse.urlencode({"symbol": "XAU/USD", "interval": TD_INT[tf],
-                                "outputsize": 200, "apikey": key})
+                                "outputsize": 1000, "timezone": "UTC", "apikey": key})
     d = get_json(f"https://api.twelvedata.com/time_series?{q}")
     if d.get("status") == "error" or "values" not in d:
         raise RuntimeError(d.get("message", "errore Twelve Data"))
-    return [(float(v["high"]), float(v["low"]), float(v["close"]))
+    return [(float(v["high"]), float(v["low"]), float(v["close"]), td_epoch(v["datetime"]))
             for v in reversed(d["values"])]  # dal piu' vecchio
 
 
@@ -172,8 +187,8 @@ def adx(candles, period=14):
         return None
     tr, pdm, mdm = [], [], []
     for i in range(1, n):
-        h, l, _ = candles[i]
-        ph, pl, pc = candles[i - 1]
+        h, l = candles[i][0], candles[i][1]
+        ph, pl, pc = candles[i - 1][0], candles[i - 1][1], candles[i - 1][2]
         up, down = h - ph, pl - l
         pdm.append(up if up > down and up > 0 else 0.0)
         mdm.append(down if down > up and down > 0 else 0.0)
@@ -320,27 +335,26 @@ def add_alert(cmd, args, cfg, state):
 
 
 def status_text(cfg):
-    tf = cfg.get("timeframe", "15m")
-    rp = int(cfg.get("rsi_period", 14))
-    ap = int(cfg.get("adx_period", 14))
-    righe = [f"📊 Situazione adesso ({tf}, candela in corso):"]
+    sc = cfg.get("strategy") or {}
+    tf = sc.get("timeframe", cfg.get("timeframe", "15m"))
+    n_ema = int(sc.get("ema", 200))
+    period = int(cfg.get("rsi_period", 14))
+    righe = [f"📊 Situazione ({tf}, indicatori sull'ultima candela chiusa)"]
     for sym, name in (("BTC", "BTC"), ("XAU", "Oro (XAUUSD)")):
         try:
-            c = data(sym, tf)
-            parti = [f"prezzo {c[-1][2]:,.2f}"]
-            ax = adx(c, ap)
-            if ax:
-                trend = "rialzista" if ax[1] > ax[2] else "ribassista"
-                parti.append(f"ADX({ap}) {ax[0]:.1f} ({trend})")
-            r = rsi([x[2] for x in c], rp)
-            if r is not None:
-                parti.append(f"RSI({rp}) {r:.1f}")
-            righe.append(f"{name}: " + " | ".join(parti))
+            live = data(sym, tf)[-1][2]
+            d = analyze(sym, tf, cfg, sc)
+            if d is None:
+                righe.append(f"\n{name}: storico insufficiente")
+                continue
+            righe.append(f"\n{name}: prezzo {live:,.2f}")
+            righe.append(f"RSI({period}) {d['rsi']:.1f}")
+            righe.extend(context_lines(d, n_ema))
         except MarketClosed:
-            righe.append(f"{name}: mercato chiuso")
+            righe.append(f"\n{name}: mercato chiuso")
         except Exception as e:
             print(f"stato {sym}: {e}")
-            righe.append(f"{name}: dati non disponibili")
+            righe.append(f"\n{name}: dati non disponibili")
     return "\n".join(righe)
 
 
@@ -424,9 +438,124 @@ def handle_commands(cfg, state):
             print(f"risposta non inviata: {e}")
 
 
-def check_alerts(cfg, state):
-    new_state = {}
+def ema_series(values, n):
+    k = 2 / (n + 1)
+    e = values[0]
+    out = [e]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+        out.append(e)
+    return out
+
+
+def macd_calc(values, fast=12, slow=26, sig=9):
+    ef, es = ema_series(values, fast), ema_series(values, slow)
+    macd = [a - b for a, b in zip(ef, es)]
+    sg = ema_series(macd, sig)
+    return macd, sg, [m - x for m, x in zip(macd, sg)]
+
+
+def closed_candles(c, tf):
+    """Toglie l'ultima candela se e' ancora in corso."""
+    if c and c[-1][3] + TF_SEC[tf] > time.time():
+        return c[:-1]
+    return c
+
+
+def analyze(sym, tf, cfg, sc):
+    """RSI, EMA e MACD sull'ultima candela CHIUSA. None se lo storico non basta."""
+    c = closed_candles(data(sym, tf), tf)
+    closes = [x[2] for x in c]
+    n_ema = int(sc.get("ema", 200))
+    if len(closes) < n_ema + 20:
+        return None
+    period = int(cfg.get("rsi_period", 14))
+    fast, slow, sig = sc.get("macd", [12, 26, 9])
+    macd, sg, hist = macd_calc(closes, int(fast), int(slow), int(sig))
+    return {
+        "t": int(c[-1][3]), "price": closes[-1],
+        "rsi": rsi(closes, period), "rsi_prev": rsi(closes[:-1], period),
+        "ema": ema_series(closes, n_ema)[-1],
+        "macd": macd[-1], "signal": sg[-1], "hist": hist[-1], "hist_prev": hist[-2],
+    }
+
+
+def context_lines(d, n_ema):
+    pct = (d["price"] - d["ema"]) / d["ema"] * 100
+    trend = "rialzista" if d["price"] > d["ema"] else "ribassista"
+    verso = "rialzista" if d["hist"] > 0 else "ribassista"
+    forza = "in rafforzamento" if abs(d["hist"]) > abs(d["hist_prev"]) else "in indebolimento"
+    return [
+        f"Trend EMA{n_ema}: {trend} (prezzo {pct:+.2f}% rispetto a {d['ema']:,.2f})",
+        f"MACD {d['macd']:+.2f} | segnale {d['signal']:+.2f} | "
+        f"istogramma {d['hist']:+.2f} ({verso}, {forza})",
+    ]
+
+
+def check_strategy(cfg, state):
+    """Alert a chiusura candela: RSI <= soglia long, RSI >= soglia short.
+    Ritorna gli asset con errore sui dati."""
+    sc = cfg.get("strategy") or {}
     failed = set()
+    if not sc or not sc.get("enabled", True):
+        return failed
+    tf = sc.get("timeframe", "15m")
+    lo, hi = float(sc.get("rsi_long", 35)), float(sc.get("rsi_short", 65))
+    n_ema = int(sc.get("ema", 200))
+    period = int(cfg.get("rsi_period", 14))
+    for sym in sc.get("symbols", ["BTC", "XAU"]):
+        sym = norm(sym)
+        name = "Oro (XAUUSD)" if sym == "XAU" else "BTC"
+        try:
+            d = analyze(sym, tf, cfg, sc)
+        except MarketClosed:
+            continue
+        except Exception as e:
+            print(f"strategia {sym}: {e}")
+            failed.add(sym)
+            continue
+        if d is None or d["rsi"] is None:
+            print(f"strategia {sym}: storico insufficiente")
+            failed.add(sym)
+            continue
+        print(f"strategia {sym} {tf}: RSI {d['rsi']:.1f}, prezzo {d['price']:.2f}, EMA{n_ema} {d['ema']:.2f}")
+
+        if d["rsi"] <= lo:
+            side = "long"
+        elif d["rsi"] >= hi:
+            side = "short"
+        else:
+            continue
+        prev = d["rsi_prev"]
+        if sc.get("solo_prima_candela") and prev is not None and \
+                ((side == "long" and prev <= lo) or (side == "short" and prev >= hi)):
+            continue  # la candela precedente aveva gia' dato il segnale
+        key = f"_sig|{sym}|{side}"
+        if state.get(key) == d["t"]:
+            continue  # segnale gia' inviato per questa candela
+
+        if side == "long":
+            testa = f"🟢 LONG {name} ({tf})"
+            cond = f"RSI({period}) = {d['rsi']:.1f}, uguale o sotto {fmt(lo)}"
+        else:
+            testa = f"🔴 SHORT {name} ({tf})"
+            cond = f"RSI({period}) = {d['rsi']:.1f}, uguale o sopra {fmt(hi)}"
+        in_linea = (d["price"] > d["ema"]) == (side == "long")
+        coda = (f"✅ In linea col trend EMA{n_ema}" if in_linea
+                else f"⚠️ Contro il trend EMA{n_ema}")
+        msg = "\n".join([testa, cond + " alla chiusura della candela",
+                         f"Prezzo {d['price']:,.2f}"] + context_lines(d, n_ema) + [coda])
+        try:
+            telegram(msg)
+            state[key] = d["t"]
+        except Exception as e:
+            print(f"invio fallito, riprovo al prossimo giro: {e}")
+    return failed
+
+
+def check_alerts(cfg, state, failed=None):
+    new_state = {}
+    failed = set(failed or ())
     for a in cfg["alerts"]:
         key = alert_key(a, cfg)
         was = state.get(key, False)
@@ -505,7 +634,8 @@ def main():
         state = {k: v for k, v in state.items() if not k.startswith("XAU|")}
         state["_src_xau"] = "twelvedata"
     handle_commands(cfg, state)
-    state = check_alerts(cfg, state)
+    failed = check_strategy(cfg, state)
+    state = check_alerts(cfg, state, failed)
     if cfg.get("heartbeat", True):
         heartbeat(cfg, state)
     save_json(STATE, state)
