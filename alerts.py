@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Alert RSI e livelli di prezzo per BTC e oro, gestiti da chat Telegram.
 
-Dati: Binance (data-api.binance.vision), con ripiego su Kraken.
-Oro: si usa PAXG (token legato all'oro), vicino all'XAUUSD ma non identico.
-Comandi Telegram: /alert, /rsi, /lista, /cancella, /aiuto.
+BTC: Binance (data-api.binance.vision), con ripiego su Kraken.
+Oro: XAU/USD reale (spot) da Twelve Data, chiave nel secret TWELVEDATA_KEY.
+Il mercato dell'oro e' chiuso nel weekend: in quel periodo non viene controllato.
+Comandi Telegram: /alert, /rsi, /adx, /lista, /stato, /cancella, /aiuto.
 """
 import datetime
 import json
@@ -17,8 +18,11 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(BASE, "alerts.json")
 STATE = os.path.join(BASE, "state.json")
 
-BINANCE = {"BTC": "BTCUSDT", "XAU": "PAXGUSDT"}
-KRAKEN = {"BTC": "XBTUSD", "XAU": "PAXGUSD"}
+BINANCE = {"BTC": "BTCUSDT"}
+KRAKEN = {"BTC": "XBTUSD"}
+SUPPORTED = ("BTC", "XAU")
+TD_INT = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
+          "1h": "1h", "4h": "4h", "1d": "1day"}
 KRAKEN_MIN = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
 ALIASES = {"BTCUSD": "BTC", "BTCUSDT": "BTC", "BITCOIN": "BTC",
            "XAUUSD": "XAU", "GOLD": "XAU", "ORO": "XAU"}
@@ -31,10 +35,12 @@ HELP = (
     "/alert oro sotto 4000\n"
     "/rsi btc sopra 75\n"
     "/rsi oro sotto 25 1h\n"
+    "/adx btc sopra 25\n"
+    "/adx oro sopra 30 1h\n"
     "/lista  (mostra gli alert)\n"
-    "/stato  (prezzo e RSI adesso)\n"
+    "/stato  (prezzo, ADX e RSI adesso)\n"
     "/cancella 2  (cancella l'alert numero 2)\n\n"
-    "Timeframe RSI: 5m, 15m, 30m, 1h, 4h, 1d.\n"
+    "Timeframe RSI e ADX: 5m, 15m, 30m, 1h, 4h, 1d.\n"
     "Le modifiche vengono applicate entro circa 5 minuti."
 )
 
@@ -79,23 +85,48 @@ def get_json(url):
         return json.load(r)
 
 
-def closes_binance(sym, tf):
+def candles_binance(sym, tf):
     q = urllib.parse.urlencode({"symbol": BINANCE[sym], "interval": tf, "limit": 200})
     rows = get_json(f"https://data-api.binance.vision/api/v3/klines?{q}")
-    return [float(r[4]) for r in rows]
+    return [(float(r[2]), float(r[3]), float(r[4])) for r in rows]
 
 
-def closes_kraken(sym, tf):
+def candles_kraken(sym, tf):
     q = urllib.parse.urlencode({"pair": KRAKEN[sym], "interval": KRAKEN_MIN[tf]})
     data = get_json(f"https://api.kraken.com/0/public/OHLC?{q}")
     if data.get("error"):
         raise RuntimeError(data["error"])
     rows = next(v for k, v in data["result"].items() if k != "last")
-    return [float(r[4]) for r in rows][-200:]
+    return [(float(r[2]), float(r[3]), float(r[4])) for r in rows][-200:]
 
 
-def get_closes(sym, tf):
-    for fn in (closes_binance, closes_kraken):
+class MarketClosed(Exception):
+    """Mercato dell'oro chiuso (weekend)."""
+
+
+def gold_market_closed():
+    n = datetime.datetime.now(datetime.timezone.utc)
+    wd, h = n.weekday(), n.hour  # lunedi=0 ... domenica=6
+    return wd == 5 or (wd == 4 and h >= 22) or (wd == 6 and h < 21)
+
+
+def candles_twelvedata(tf):
+    key = (os.environ.get("TWELVEDATA_KEY") or "").strip()
+    if not key:
+        raise RuntimeError("TWELVEDATA_KEY mancante")
+    q = urllib.parse.urlencode({"symbol": "XAU/USD", "interval": TD_INT[tf],
+                                "outputsize": 200, "apikey": key})
+    d = get_json(f"https://api.twelvedata.com/time_series?{q}")
+    if d.get("status") == "error" or "values" not in d:
+        raise RuntimeError(d.get("message", "errore Twelve Data"))
+    return [(float(v["high"]), float(v["low"]), float(v["close"]))
+            for v in reversed(d["values"])]  # dal piu' vecchio
+
+
+def get_candles(sym, tf):
+    if sym == "XAU":
+        return candles_twelvedata(tf)
+    for fn in (candles_binance, candles_kraken):
         try:
             return fn(sym, tf)
         except Exception as e:  # prova la fonte successiva
@@ -107,8 +138,10 @@ _cache = {}
 
 
 def data(sym, tf):
+    if sym == "XAU" and gold_market_closed():
+        raise MarketClosed()
     if (sym, tf) not in _cache:
-        _cache[(sym, tf)] = get_closes(sym, tf)
+        _cache[(sym, tf)] = get_candles(sym, tf)
     return _cache[(sym, tf)]
 
 
@@ -131,11 +164,51 @@ def rsi(values, period=14):
     return 100 - 100 / (1 + avg_g / avg_l)
 
 
+def adx(candles, period=14):
+    """ADX di Wilder. candles = [(high, low, close)] dal piu' vecchio.
+    Ritorna (ADX, +DI, -DI) oppure None se i dati non bastano."""
+    n = len(candles)
+    if n < 2 * period + 1:
+        return None
+    tr, pdm, mdm = [], [], []
+    for i in range(1, n):
+        h, l, _ = candles[i]
+        ph, pl, pc = candles[i - 1]
+        up, down = h - ph, pl - l
+        pdm.append(up if up > down and up > 0 else 0.0)
+        mdm.append(down if down > up and down > 0 else 0.0)
+        tr.append(max(h - l, abs(h - pc), abs(l - pc)))
+
+    def di_dx(atr, p, m):
+        if atr == 0:
+            return 0.0, 0.0, 0.0
+        pdi, mdi = 100 * p / atr, 100 * m / atr
+        tot = pdi + mdi
+        return pdi, mdi, (100 * abs(pdi - mdi) / tot if tot else 0.0)
+
+    atr, p, m = sum(tr[:period]), sum(pdm[:period]), sum(mdm[:period])
+    pdi, mdi, dx = di_dx(atr, p, m)
+    dxs = [dx]
+    for i in range(period, len(tr)):
+        atr = atr - atr / period + tr[i]
+        p = p - p / period + pdm[i]
+        m = m - m / period + mdm[i]
+        pdi, mdi, dx = di_dx(atr, p, m)
+        dxs.append(dx)
+    if len(dxs) < period:
+        return None
+    a = sum(dxs[:period]) / period
+    for dx in dxs[period:]:
+        a = (a * (period - 1) + dx) / period
+    return a, pdi, mdi
+
+
 # ---------- alert ----------
 def alert_tf(a, cfg):
-    if a["type"] == "rsi":
+    if a["type"] in ("rsi", "adx"):
         return a.get("timeframe", cfg.get("timeframe", "15m"))
-    return "1m"
+    # prezzo: BTC a 1 minuto; oro sullo stesso timeframe degli altri (risparmia richieste)
+    return "1m" if norm(a["symbol"]) == "BTC" else cfg.get("timeframe", "15m")
 
 
 def alert_key(a, cfg):
@@ -143,12 +216,22 @@ def alert_key(a, cfg):
             f"{fmt(a['value'])}|{alert_tf(a, cfg)}")
 
 
+def adx_info(a, cfg):
+    """(ADX, +DI, -DI) sulla candela in corso, o None se i dati non bastano."""
+    c = data(norm(a["symbol"]), alert_tf(a, cfg))
+    return adx(c, int(cfg.get("adx_period", 14)))
+
+
 def current_value(a, cfg):
     """Ritorna (valore da confrontare, prezzo attuale)."""
     c = data(norm(a["symbol"]), alert_tf(a, cfg))
-    price = c[-1]
+    closes = [x[2] for x in c]
+    price = closes[-1]
     if a["type"] == "rsi":
-        return rsi(c[:-1], int(cfg.get("rsi_period", 14))), price  # esclude candela aperta
+        return rsi(closes[:-1], int(cfg.get("rsi_period", 14))), price  # esclude candela aperta
+    if a["type"] == "adx":
+        r = adx(c, int(cfg.get("adx_period", 14)))  # include la candela in corso: avviso subito
+        return (r[0] if r else None), price
     return price, price
 
 
@@ -160,6 +243,8 @@ def is_hit(a, cur):
 def describe(a, cfg):
     name = "Oro" if norm(a["symbol"]) == "XAU" else "BTC"
     verso = "sopra" if a["condition"] == "above" else "sotto"
+    if a["type"] == "adx":
+        return f"{name} ADX({int(cfg.get('adx_period', 14))}, {alert_tf(a, cfg)}) {verso} {fmt(a['value'])}"
     if a["type"] == "rsi":
         return f"{name} RSI({int(cfg.get('rsi_period', 14))}, {alert_tf(a, cfg)}) {verso} {fmt(a['value'])}"
     return f"{name} prezzo {verso} {fmt(a['value'])}"
@@ -195,18 +280,18 @@ def tg_api(method, **params):
 
 def add_alert(cmd, args, cfg, state):
     sym = norm(args[0])
-    if sym not in BINANCE:
+    if sym not in SUPPORTED:
         return f"Asset non supportato: {args[0]}. Usa btc o oro.", False
     cond = DIRS.get(args[1])
     if cond is None:
         raise ValueError("direzione")
     val = parse_num(args[2])
     val = int(val) if val == int(val) else val
-    a = {"symbol": sym, "type": "rsi" if cmd == "rsi" else "price",
+    a = {"symbol": sym, "type": {"alert": "price"}.get(cmd, cmd),
          "condition": cond, "value": val}
-    if cmd == "rsi":
+    if cmd in ("rsi", "adx"):
         if not 0 < val < 100:
-            return "L'RSI deve essere tra 0 e 100.", False
+            return "RSI e ADX vanno da 0 a 100.", False
         if len(args) > 3:
             if args[3] not in KRAKEN_MIN:
                 return "Timeframe valido: 5m, 15m, 30m, 1h, 4h, 1d.", False
@@ -236,17 +321,23 @@ def add_alert(cmd, args, cfg, state):
 
 def status_text(cfg):
     tf = cfg.get("timeframe", "15m")
-    period = int(cfg.get("rsi_period", 14))
-    righe = [f"📊 Situazione adesso (RSI {period}, {tf}):"]
-    for sym, name in (("BTC", "BTC"), ("XAU", "Oro (PAXG)")):
+    rp = int(cfg.get("rsi_period", 14))
+    ap = int(cfg.get("adx_period", 14))
+    righe = [f"📊 Situazione adesso ({tf}, candela in corso):"]
+    for sym, name in (("BTC", "BTC"), ("XAU", "Oro (XAUUSD)")):
         try:
             c = data(sym, tf)
-            chiusa = rsi(c[:-1], period)
-            corso = rsi(c, period)
-            if chiusa is None:
-                righe.append(f"{name}: prezzo {c[-1]:,.2f}")
-            else:
-                righe.append(f"{name}: prezzo {c[-1]:,.2f} | RSI ultima candela chiusa {chiusa:.1f}, in corso {corso:.1f}")
+            parti = [f"prezzo {c[-1][2]:,.2f}"]
+            ax = adx(c, ap)
+            if ax:
+                trend = "rialzista" if ax[1] > ax[2] else "ribassista"
+                parti.append(f"ADX({ap}) {ax[0]:.1f} ({trend})")
+            r = rsi([x[2] for x in c], rp)
+            if r is not None:
+                parti.append(f"RSI({rp}) {r:.1f}")
+            righe.append(f"{name}: " + " | ".join(parti))
+        except MarketClosed:
+            righe.append(f"{name}: mercato chiuso")
         except Exception as e:
             print(f"stato {sym}: {e}")
             righe.append(f"{name}: dati non disponibili")
@@ -286,7 +377,7 @@ def run_command(text, cfg, state):
                 return "Numero non valido. Usa /lista.", False
             removed = cfg["alerts"].pop(n - 1)
             return f"🗑 Cancellato: {describe(removed, cfg)}", True
-        if cmd in ("alert", "rsi"):
+        if cmd in ("alert", "rsi", "adx"):
             return add_alert(cmd, args, cfg, state)
     except (ValueError, IndexError, KeyError):
         pass
@@ -341,6 +432,9 @@ def check_alerts(cfg, state):
         was = state.get(key, False)
         try:
             cur, price = current_value(a, cfg)
+        except MarketClosed:
+            new_state[key] = was
+            continue
         except Exception as e:
             print(f"salto {key}: {e}")
             failed.add(norm(a["symbol"]))
@@ -351,11 +445,22 @@ def check_alerts(cfg, state):
             continue
 
         hit = is_hit(a, cur)
+        keep = hit
+        if a["type"] == "adx" and was and not hit:
+            v = float(a["value"])  # isteresi di 1 punto: niente avvisi ripetuti vicino alla soglia
+            keep = cur > v - 1 if a["condition"] == "above" else cur < v + 1
         print(f"{key}: valore {cur:.2f} -> {'SCATTATO' if hit else 'ok'}")
         if hit and not was:
-            name = "XAU (PAXG)" if norm(a["symbol"]) == "XAU" else "BTC"
+            name = "Oro (XAUUSD)" if norm(a["symbol"]) == "XAU" else "BTC"
             verso = "sopra" if a["condition"] == "above" else "sotto"
-            if a["type"] == "rsi":
+            if a["type"] == "adx":
+                info = adx_info(a, cfg)
+                direz = ""
+                if info:
+                    direz = " | trend " + ("rialzista" if info[1] > info[2] else "ribassista")
+                msg = (f"🔔 {name} ADX({int(cfg.get('adx_period', 14))}, {alert_tf(a, cfg)}) = "
+                       f"{cur:.1f}, {verso} {fmt(a['value'])} | prezzo {price:,.2f}{direz}")
+            elif a["type"] == "rsi":
                 msg = (f"🔔 {name} RSI({int(cfg.get('rsi_period', 14))}, {alert_tf(a, cfg)}) = "
                        f"{cur:.1f}, {verso} {fmt(a['value'])} | prezzo {price:,.2f}")
             else:
@@ -366,7 +471,7 @@ def check_alerts(cfg, state):
                 print(f"invio fallito, riprovo al prossimo giro: {e}")
                 new_state[key] = was
                 continue
-        new_state[key] = hit  # si riarma quando la condizione torna falsa
+        new_state[key] = keep  # si riarma quando la condizione torna falsa
 
     # avviso se i dati di un asset non sono leggibili per 3 controlli di fila
     for sym in ("BTC", "XAU"):
@@ -396,6 +501,9 @@ def main():
     cfg = load_json(CONFIG, {"alerts": []})
     cfg.setdefault("alerts", [])
     state = load_json(STATE, {})
+    if state.get("_src_xau") != "twelvedata":  # nuova fonte oro: azzera i vecchi stati dell'oro
+        state = {k: v for k, v in state.items() if not k.startswith("XAU|")}
+        state["_src_xau"] = "twelvedata"
     handle_commands(cfg, state)
     state = check_alerts(cfg, state)
     if cfg.get("heartbeat", True):
