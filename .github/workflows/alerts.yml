@@ -1,4 +1,4 @@
-name: Alert BTC ADX e prezzo
+name: Alert BTC - RSI EMA MACD
 
 on:
   schedule:
