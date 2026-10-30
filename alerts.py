@@ -339,17 +339,23 @@ def status_text(cfg):
     tf = sc.get("timeframe", cfg.get("timeframe", "15m"))
     n_ema = int(sc.get("ema", 200))
     period = int(cfg.get("rsi_period", 14))
+    ap = int(cfg.get("adx_period", 14))
     righe = [f"📊 Situazione ({tf}, indicatori sull'ultima candela chiusa)"]
     for sym, name in (("BTC", "BTC"), ("XAU", "Oro (XAUUSD)")):
         try:
-            live = data(sym, tf)[-1][2]
+            cand = data(sym, tf)
+            live = cand[-1][2]
             d = analyze(sym, tf, cfg, sc)
             if d is None:
                 righe.append(f"\n{name}: storico insufficiente")
                 continue
             righe.append(f"\n{name}: prezzo {live:,.2f}")
             righe.append(f"RSI({period}) {d['rsi']:.1f}")
-            righe.extend(context_lines(d, n_ema))
+            ax = adx(cand, ap)
+            if ax:
+                trend = "rialzista" if ax[1] > ax[2] else "ribassista"
+                righe.append(f"ADX({ap}) {ax[0]:.1f} ({trend}, candela in corso)")
+            righe.extend(context_lines(d, n_ema, ap, with_adx=False))
         except MarketClosed:
             righe.append(f"\n{name}: mercato chiuso")
         except Exception as e:
@@ -472,7 +478,9 @@ def analyze(sym, tf, cfg, sc):
     period = int(cfg.get("rsi_period", 14))
     fast, slow, sig = sc.get("macd", [12, 26, 9])
     macd, sg, hist = macd_calc(closes, int(fast), int(slow), int(sig))
+    ax = adx(c, int(cfg.get("adx_period", 14)))
     return {
+        "adx": ax[0] if ax else None, "pdi": ax[1] if ax else None, "mdi": ax[2] if ax else None,
         "t": int(c[-1][3]), "price": closes[-1],
         "rsi": rsi(closes, period), "rsi_prev": rsi(closes[:-1], period),
         "ema": ema_series(closes, n_ema)[-1],
@@ -480,16 +488,21 @@ def analyze(sym, tf, cfg, sc):
     }
 
 
-def context_lines(d, n_ema):
+def context_lines(d, n_ema, adx_p=14, with_adx=True):
     pct = (d["price"] - d["ema"]) / d["ema"] * 100
     trend = "rialzista" if d["price"] > d["ema"] else "ribassista"
     verso = "rialzista" if d["hist"] > 0 else "ribassista"
     forza = "in rafforzamento" if abs(d["hist"]) > abs(d["hist_prev"]) else "in indebolimento"
-    return [
+    righe = [
         f"Trend EMA{n_ema}: {trend} (prezzo {pct:+.2f}% rispetto a {d['ema']:,.2f})",
         f"MACD {d['macd']:+.2f} | segnale {d['signal']:+.2f} | "
         f"istogramma {d['hist']:+.2f} ({verso}, {forza})",
     ]
+    if with_adx and d.get("adx") is not None:
+        zona = "sopra 30" if d["adx"] >= 30 else "sopra 25" if d["adx"] >= 25 else "sotto 25"
+        dirz = "rialzista" if d["pdi"] > d["mdi"] else "ribassista"
+        righe.append(f"ADX({adx_p}) {d['adx']:.1f} ({zona}, direzione {dirz})")
+    return righe
 
 
 def check_strategy(cfg, state):
@@ -503,6 +516,7 @@ def check_strategy(cfg, state):
     lo, hi = float(sc.get("rsi_long", 35)), float(sc.get("rsi_short", 65))
     n_ema = int(sc.get("ema", 200))
     period = int(cfg.get("rsi_period", 14))
+    adx_p = int(cfg.get("adx_period", 14))
     for sym in sc.get("symbols", ["BTC", "XAU"]):
         sym = norm(sym)
         name = "Oro (XAUUSD)" if sym == "XAU" else "BTC"
@@ -544,7 +558,7 @@ def check_strategy(cfg, state):
         coda = (f"✅ In linea col trend EMA{n_ema}" if in_linea
                 else f"⚠️ Contro il trend EMA{n_ema}")
         msg = "\n".join([testa, cond + " alla chiusura della candela",
-                         f"Prezzo {d['price']:,.2f}"] + context_lines(d, n_ema) + [coda])
+                         f"Prezzo {d['price']:,.2f}"] + context_lines(d, n_ema, adx_p) + [coda])
         try:
             telegram(msg)
             state[key] = d["t"]
